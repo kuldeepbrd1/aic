@@ -1,8 +1,232 @@
 """Frame transforms and geometry utilities for the AIC cable insertion task."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+if TYPE_CHECKING:
+    from geometry_msgs.msg import Pose as RosPose
+
+
+# ---------------------------------------------------------------------------
+# Internal se(3) helpers
+# ---------------------------------------------------------------------------
+
+def _skew(v: np.ndarray) -> np.ndarray:
+    """3×3 skew-symmetric matrix for v."""
+    return np.array([
+        [ 0.0,  -v[2],  v[1]],
+        [ v[2],  0.0,  -v[0]],
+        [-v[1],  v[0],  0.0 ],
+    ])
+
+
+def _se3_exp(xi: np.ndarray) -> np.ndarray:
+    """Exponential map se(3) → SE(3).
+
+    xi = [v (3), omega (3)] where v is the translational component and omega
+    is the rotation vector (axis × angle, ||omega|| = theta).
+    """
+    v, omega = xi[:3], xi[3:]
+    theta = np.linalg.norm(omega)
+    T = np.eye(4)
+    if theta < 1e-10:
+        T[:3, 3] = v
+        return T
+    R = Rotation.from_rotvec(omega).as_matrix()
+    T[:3, :3] = R
+    omega_hat = omega / theta
+    K = _skew(omega_hat)
+    # Left Jacobian: J = I + (1-cosθ)/θ K̂ + (θ-sinθ)/θ K̂²
+    J = (
+        np.eye(3)
+        + (1.0 - np.cos(theta)) / theta * K
+        + (theta - np.sin(theta)) / theta * (K @ K)
+    )
+    T[:3, 3] = J @ v
+    return T
+
+
+def _se3_log(T: np.ndarray) -> np.ndarray:
+    """Log map SE(3) → se(3).
+
+    Returns xi = [v (3), omega (3)] with ||omega|| in [0, pi].
+    """
+    R, t = T[:3, :3], T[:3, 3]
+    omega = Rotation.from_matrix(R).as_rotvec()   # ||omega|| guaranteed in [0, pi]
+    theta = np.linalg.norm(omega)
+    if theta < 1e-10:
+        return np.concatenate([t, omega])
+    omega_hat = omega / theta
+    K = _skew(omega_hat)
+    half_theta = theta / 2.0
+    # J^{-1} = α I + (1-α) ω̂ω̂ᵀ − (θ/2) K̂,  α = (θ/2) / tan(θ/2)
+    alpha = half_theta / np.tan(half_theta)
+    J_inv = (
+        alpha * np.eye(3)
+        + (1.0 - alpha) * np.outer(omega_hat, omega_hat)
+        - half_theta * K
+    )
+    return np.concatenate([J_inv @ t, omega])
+
+
+# ---------------------------------------------------------------------------
+# Pose
+# ---------------------------------------------------------------------------
+
+@dataclass(eq=False)
+class Pose:
+    """SE(3) pose with Lie group / algebra helpers.
+
+    Internal storage: translation ``t`` (shape (3,)) and rotation ``r``
+    (scipy ``Rotation``). Use class-methods to construct from common formats
+    and ``as_*`` methods to convert.
+
+    Twist convention (``as_twist`` / ``from_twist``): xi = [v (3), omega (3)]
+    where v is the translational component and omega is the rotation vector
+    (axis × angle). This matches the controller's ``tcp_error`` layout
+    ``(x, y, z, rx, ry, rz)``.
+    """
+
+    t: np.ndarray   # translation, shape (3,)
+    r: Rotation     # orientation
+
+    # ------------------------------------------------------------------
+    # Constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def identity(cls) -> Pose:
+        """Return the SE(3) identity."""
+        return cls(t=np.zeros(3), r=Rotation.identity())
+
+    @classmethod
+    def from_matrix(cls, T: np.ndarray) -> Pose:
+        """Construct from a 4×4 homogeneous transform matrix."""
+        return cls(t=T[:3, 3].copy(), r=Rotation.from_matrix(T[:3, :3]))
+
+    @classmethod
+    def from_quat(cls, t: np.ndarray, q: np.ndarray) -> Pose:
+        """Construct from translation and quaternion [x, y, z, w]."""
+        return cls(t=np.asarray(t, dtype=float), r=Rotation.from_quat(q))
+
+    @classmethod
+    def from_rotvec(cls, t: np.ndarray, rotvec: np.ndarray) -> Pose:
+        """Construct from translation and SO(3) rotation vector (axis × angle)."""
+        return cls(t=np.asarray(t, dtype=float), r=Rotation.from_rotvec(rotvec))
+
+    @classmethod
+    def from_twist(cls, xi: np.ndarray) -> Pose:
+        """Construct from an se(3) twist via the exponential map.
+
+        xi = [v (3), omega (3)].
+        """
+        return cls.from_matrix(_se3_exp(np.asarray(xi, dtype=float)))
+
+    @classmethod
+    def from_ros(cls, msg: RosPose) -> Pose:
+        """Construct from a ``geometry_msgs/Pose`` message."""
+        t = np.array([msg.position.x, msg.position.y, msg.position.z])
+        q = np.array([
+            msg.orientation.x,
+            msg.orientation.y,
+            msg.orientation.z,
+            msg.orientation.w,
+        ])
+        return cls.from_quat(t, q)
+
+    # ------------------------------------------------------------------
+    # Converters
+    # ------------------------------------------------------------------
+
+    def as_matrix(self) -> np.ndarray:
+        """Return a 4×4 homogeneous transform matrix."""
+        T = np.eye(4)
+        T[:3, :3] = self.r.as_matrix()
+        T[:3, 3] = self.t
+        return T
+
+    def as_quat(self) -> np.ndarray:
+        """Return quaternion [x, y, z, w]."""
+        return self.r.as_quat()
+
+    def as_rotvec(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return (translation, rotvec) where rotvec = axis × angle."""
+        return self.t.copy(), self.r.as_rotvec()
+
+    def as_twist(self) -> np.ndarray:
+        """Return the se(3) twist via the log map.
+
+        Returns xi = [v (3), omega (3)] with ||omega|| in [0, pi].
+        """
+        return _se3_log(self.as_matrix())
+
+    def as_ros(self) -> RosPose:
+        """Return a ``geometry_msgs/Pose`` message."""
+        from geometry_msgs.msg import Point, Pose as _RosPose, Quaternion
+        q = self.r.as_quat()
+        return _RosPose(
+            position=Point(x=float(self.t[0]), y=float(self.t[1]), z=float(self.t[2])),
+            orientation=Quaternion(
+                x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3])
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Operations
+    # ------------------------------------------------------------------
+
+    def __matmul__(self, other: Pose) -> Pose:
+        """Compose two poses: self ∘ other."""
+        return Pose.from_matrix(self.as_matrix() @ other.as_matrix())
+
+    def inv(self) -> Pose:
+        """Return the inverse pose."""
+        r_inv = self.r.inv()
+        return Pose(t=-(r_inv.as_matrix() @ self.t), r=r_inv)
+
+    def transform_point(self, p: np.ndarray) -> np.ndarray:
+        """Apply this pose to a point: R @ p + t."""
+        return self.r.apply(p) + self.t
+
+    # ------------------------------------------------------------------
+    # Lie algebra helpers
+    # ------------------------------------------------------------------
+
+    def perturb(self, xi: np.ndarray) -> Pose:
+        """Return self right-composed with exp(xi).
+
+        Applies a small twist xi (in self's body frame) to produce a
+        perturbed pose. xi = [v (3), omega (3)].
+        """
+        return self @ Pose.from_twist(xi)
+
+    def log_diff(self, other: Pose) -> np.ndarray:
+        """Twist from self to other expressed in self's frame.
+
+        Returns log(self⁻¹ ∘ other) as xi = [v (3), omega (3)].
+        """
+        return (self.inv() @ other).as_twist()
+
+    # ------------------------------------------------------------------
+    # Dunder helpers
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        q = self.r.as_quat()
+        return (
+            f"Pose(t=[{self.t[0]:.4f}, {self.t[1]:.4f}, {self.t[2]:.4f}], "
+            f"q=[{q[0]:.4f}, {q[1]:.4f}, {q[2]:.4f}, {q[3]:.4f}])"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Standalone helpers (kept for backward compatibility)
+# ---------------------------------------------------------------------------
 
 def pose_to_matrix(position: np.ndarray, quaternion: np.ndarray) -> np.ndarray:
     """Convert position [x,y,z] + quaternion [x,y,z,w] to 4×4 homogeneous matrix."""

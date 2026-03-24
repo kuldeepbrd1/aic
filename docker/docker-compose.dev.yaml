@@ -1,0 +1,24 @@
+# Dev override for docker-compose.yaml.
+#
+# Publishes the eval container's Zenoh router port to the host so that the
+# dev container (or the host itself) can connect to it directly.
+#
+# Usage (from the repo root, or from a terminal inside the dev container):
+#
+#   docker compose -f docker/docker-compose.yaml \
+#                  -f docker/docker-compose.dev.yaml \
+#                  up eval
+#
+# Then run your model inside the dev container:
+#
+#   AIC_ROUTER_ADDR=host.docker.internal:7447 \
+#     pixi run ros2 run aic_model aic_model \
+#       --ros-args -p policy:=aic_example_policies.ros.CheatCode
+#
+services:
+  eval:
+    ports:
+      - "7447:7447"
+networks:
+  default:
+    internal: false

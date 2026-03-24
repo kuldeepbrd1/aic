@@ -1,0 +1,38 @@
+{
+    "name": "AIC Dev Container",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    // Mount the workspace source so edits on the host are immediately reflected.
+    "workspaceMount": "source=${localWorkspaceFolder},target=/ws_aic/src/aic,type=bind,consistency=cached",
+    "workspaceFolder": "/ws_aic/src/aic",
+    "mounts": [
+        // Expose the host Docker socket so you can start/stop the eval container
+        // from inside the dev container with `docker compose`.
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+    ],
+    // Resolve host.docker.internal on Linux (natively available on macOS/Windows).
+    "runArgs": ["--add-host=host.docker.internal:host-gateway"],
+    "remoteEnv": {
+        "RMW_IMPLEMENTATION": "rmw_zenoh_cpp",
+        "ZENOH_CONFIG_OVERRIDE": "transport/shared_memory/enabled=false",
+        "PATH": "/root/.pixi/bin:${containerEnv:PATH}"
+    },
+    // Install Pixi dependencies on first container start (cached in .pixi/ inside the workspace).
+    "postCreateCommand": "pixi install --locked",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.pylance",
+                "ms-iot.vscode-ros",
+                "tamasfe.even-better-toml",
+                "charliermarsh.ruff"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/ws_aic/src/aic/.pixi/envs/default/bin/python"
+            }
+        }
+    }
+}

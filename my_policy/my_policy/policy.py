@@ -124,14 +124,6 @@ class ProximityFirstPolicy(Policy):
         )
         return pose, target_pos
 
-    def _obs_tcp_pos(self, get_observation: GetObservationCallback) -> np.ndarray:
-        tcp = get_observation().controller_state.tcp_pose.position
-        return np.array([tcp.x, tcp.y, tcp.z])
-
-    def _obs_force_mag(self, get_observation: GetObservationCallback) -> float:
-        f = get_observation().wrist_wrench.wrench.force
-        return float(np.linalg.norm([f.x, f.y, f.z]))
-
     def _log_step(
         self,
         episode_id: str,
@@ -141,9 +133,10 @@ class ProximityFirstPolicy(Policy):
         target_pos: np.ndarray | None = None,
         stop_reason: str = "",
         insertion_depth_m: float = 0.0,
-    ) -> None:
+    ) -> tuple[np.ndarray, float]:
         obs = get_observation()
         tcp = obs.controller_state.tcp_pose.position
+        tcp_pos = np.array([tcp.x, tcp.y, tcp.z])
         f = obs.wrist_wrench.wrench.force
         force_mag = float(np.linalg.norm([f.x, f.y, f.z]))
         tp = target_pos if target_pos is not None else np.zeros(3)
@@ -168,33 +161,37 @@ class ProximityFirstPolicy(Policy):
                 insertion_depth_m=insertion_depth_m,
             )
         )
+        return tcp_pos, force_mag
 
     def _run_approach(
         self,
         phase: Phase,
         episode_id: str,
-        step: list[int],
+        step: int,
         get_observation: GetObservationCallback,
         move_robot: MoveRobotCallback,
         send_feedback: SendFeedbackCallback,
         target_pose: Pose,
         target_pos: np.ndarray,
-    ) -> None:
-        """Step toward target_pose until within POSITION_TOL_M or step cap hit."""
+    ) -> int:
+        """Step toward target_pose until within POSITION_TOL_M or step cap hit.
+
+        Returns the updated step count.
+        """
         send_feedback(phase.value)
         self.get_logger().info(
             f"{phase.value}: target=({target_pos[0]:.3f}, "
             f"{target_pos[1]:.3f}, {target_pos[2]:.3f})"
         )
         for _ in range(MAX_APPROACH_STEPS):
-            self._log_step(episode_id, step[0], phase, get_observation, target_pos)
-            step[0] += 1
+            tcp_pos, _ = self._log_step(episode_id, step, phase, get_observation, target_pos)
+            step += 1
             self.set_pose_target(move_robot=move_robot, pose=target_pose)
-            tcp_pos = self._obs_tcp_pos(get_observation)
             if np.linalg.norm(target_pos - tcp_pos) < POSITION_TOL_M:
                 self.get_logger().info(f"{phase.value}: converged")
                 break
             self.sleep_for(STEP_DT_S)
+        return step
 
     # ------------------------------------------------------------------
     # Policy entry point
@@ -215,7 +212,7 @@ class ProximityFirstPolicy(Policy):
         """
         episode_id = task.id or f"ep_{self.time_now().nanoseconds}"
         self.logger.start_episode(episode_id)
-        step = [0]  # mutable so helpers can increment it
+        step = 0
 
         # --- Bootstrap: resolve port TF ---
         send_feedback(Phase.BOOTSTRAP.value)
@@ -244,7 +241,7 @@ class ProximityFirstPolicy(Policy):
 
         # --- Coarse approach (50 mm standoff) ---
         coarse_pose, coarse_pos = self._make_target_pose(port_tf, COARSE_STANDOFF_M)
-        self._run_approach(
+        step = self._run_approach(
             Phase.COARSE_APPROACH, episode_id, step,
             get_observation, move_robot, send_feedback,
             coarse_pose, coarse_pos,
@@ -252,7 +249,7 @@ class ProximityFirstPolicy(Policy):
 
         # --- Fine approach (5 mm standoff) ---
         fine_pose, fine_pos = self._make_target_pose(port_tf, FINE_STANDOFF_M)
-        self._run_approach(
+        step = self._run_approach(
             Phase.FINE_APPROACH, episode_id, step,
             get_observation, move_robot, send_feedback,
             fine_pose, fine_pos,
@@ -264,10 +261,10 @@ class ProximityFirstPolicy(Policy):
         elapsed = 0.0
         while elapsed < HOLD_DURATION_S:
             self._log_step(
-                episode_id, step[0], Phase.ALIGNMENT_HOLD,
+                episode_id, step, Phase.ALIGNMENT_HOLD,
                 get_observation, fine_pos,
             )
-            step[0] += 1
+            step += 1
             self.set_pose_target(move_robot=move_robot, pose=fine_pose)
             self.sleep_for(STEP_DT_S)
             elapsed += STEP_DT_S
